@@ -68,8 +68,11 @@ pub struct Config {
     /// Default editor command (for future extension)
     pub editor_command: Option<String>,
 
-    // /// Whether to enable auto-saving (for future extension)
-    // pub auto_save: bool,
+    /// Whether to enable auto-saving (for future extension)
+    pub auto_save: bool,
+ 
+    /// Whether to enable auto-saving (for future extension)
+    pub auto_backup: bool,
     
     // /// Auto-save interval in minutes (if auto_save is enabled) (for future extension)
     // pub auto_save_interval: u32,

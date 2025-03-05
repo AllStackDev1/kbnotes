@@ -4,16 +4,17 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4.0", features = ["derive"] }
+chrono = { version = "0.4.40", features = ["serde"] }
+clap = { version = "4.5.31", features = ["derive"] }
 directories = "6.0.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde = { version = "1.0.218", features = ["derive"] }
+serde_json = "1.0.140"
 pulldown-cmark = "0.13.0"
-walkdir = "2.3"
+walkdir = "2.5.0"
 thiserror = "2.0.12"
-fuzzy-matcher = "0.3"
+fuzzy-matcher = "0.3.7"
 notify = "8.0.0"
-log = "0.4"
+log = "0.4.26"
 env_logger = "0.11.6"
 dirs = "6.0.0"
+tempfile="3.17.1"
