@@ -3,9 +3,10 @@
 //! This module contains the primary types used throughout the application,
 //! including Note and Config structures.
 
+use std::path::PathBuf;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 /// Represents a single note in our system
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +45,41 @@ impl Note {
             updated_at: now,
         }
     }
+}
+
+/// Represents the expected state of a note for concurrency control
+pub struct NoteVersion {
+    /// The ID of the note
+    pub id: String,
+    /// The expected last update timestamp
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Summary of a backup restoration operation
+#[derive(Debug, Clone)]
+pub struct RestoreBackupSummary {
+    /// Path to the backup file that was restored
+    pub backup_file: PathBuf,
+    /// Total number of notes found in the backup
+    pub total_notes: usize,
+    /// Number of notes successfully restored
+    pub notes_restored: usize,
+    /// Number of notes skipped (e.g., due to existing notes with overwrite disabled)
+    pub notes_skipped: usize,
+    /// Details about notes that failed to restore
+    pub failed_notes: Vec<(String, String)>, // (note_id, error_message)
+}
+
+/// Represents the result of an attempt to resolve a concurrent modification conflict
+pub enum ConflictResolution {
+    /// The update should use the client's version (force update)
+    UseClientVersion,
+    /// The update should use the server's version (discard changes)
+    UseServerVersion,
+    /// The update should use a merged version
+    UseMergedVersion(Note),
+    /// The conflict was not resolved
+    Unresolved,
 }
 
 /// Application configuration settings.

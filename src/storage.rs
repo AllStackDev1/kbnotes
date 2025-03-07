@@ -3,21 +3,21 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::sync::{mpsc as std_mpsc, Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use log::{debug, error, info, trace, warn};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tempfile::NamedTempFile;
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{mpsc, Mutex as TokioMutex};
 use walkdir::WalkDir;
 use zip::{write::FileOptions, ZipArchive, ZipWriter};
 
 use crate::backup_scheduler::{BackupScheduler, BackupSchedulerStatus};
 use crate::errors::{KbError, Result};
-use crate::storage;
-use crate::types::{Config, Note};
+use crate::helper::{handle_fs_event, load_note_from_file};
+use crate::types::{Config, ConflictResolution, Note, NoteVersion, RestoreBackupSummary};
 
 /// Manages the storage, retrieval, and synchronization of notes.
 pub struct NoteStorage {
@@ -35,21 +35,6 @@ pub struct NoteStorage {
 
     /// Backup scheduler for automated backups
     backup_scheduler: Arc<TokioMutex<BackupScheduler>>,
-}
-
-/// Summary of a backup restoration operation
-#[derive(Debug, Clone)]
-pub struct RestoreBackupSummary {
-    /// Path to the backup file that was restored
-    pub backup_file: PathBuf,
-    /// Total number of notes found in the backup
-    pub total_notes: usize,
-    /// Number of notes successfully restored
-    pub notes_restored: usize,
-    /// Number of notes skipped (e.g., due to existing notes with overwrite disabled)
-    pub notes_skipped: usize,
-    /// Details about notes that failed to restore
-    pub failed_notes: Vec<(String, String)>, // (note_id, error_message)
 }
 
 impl NoteStorage {
@@ -138,7 +123,15 @@ impl NoteStorage {
             Err(e) => error!("Failed to start backup scheduler: {}", e),
         }
 
+        drop(scheduler);
+
+        // Initialize the file watcher synchronously but do the actual watching
+        // in a background task
+        self.init_watcher_with_background_task().await?;
+
         info!("NoteStorage initialization complete");
+
+        self.initialized = true;
 
         Ok(())
     }
@@ -151,7 +144,7 @@ impl NoteStorage {
     pub fn load_notes(&mut self) -> Result<usize> {
         // Ensure notes directory exists
         if !self.config.notes_dir.exists() {
-            fs::create_dir_all(&self.config.notes_dir).map_err(|e| KbError::Io(e))?;
+            fs::create_dir_all(&self.config.notes_dir).map_err(KbError::Io)?;
             info!(
                 "Created notes directory: {}",
                 self.config.notes_dir.display()
@@ -173,7 +166,7 @@ impl NoteStorage {
 
             // Only process JSON files
             if path.is_file() && path.extension().is_some_and(|ext| ext == "json") {
-                match self.load_note_from_file(path) {
+                match load_note_from_file(path) {
                     Ok(note) => {
                         // Add to our temporary buffer instead of directly to cache
                         notes_buffer.insert(note.id.clone(), note);
@@ -223,27 +216,6 @@ impl NoteStorage {
 
         self.initialized = true;
         Ok(notes_count)
-    }
-
-    /// Helper method to load a single note from file
-    fn load_note_from_file(&self, path: &Path) -> Result<Note> {
-        debug!("Loading note from file: {}", path.display());
-        let content = fs::read_to_string(path).map_err(|e| {
-            error!("Failed to open note file {}: {}", path.display(), e);
-            KbError::Io(e)
-        })?;
-
-        let note: Note = serde_json::from_str(&content)?;
-
-        // Validate note
-        if note.id.is_empty() {
-            let error_mgs = format!("Note from {} has an empty ID", path.display());
-            error!("{}", error_mgs);
-            return Err(KbError::InvalidFormat { message: error_mgs });
-        }
-
-        trace!("Successfully loaded note: {}", note.id);
-        Ok(note)
     }
 
     /// Saves a note to storage using atomic operations to prevent data corruption
@@ -421,8 +393,7 @@ impl NoteStorage {
             .into_iter()
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
-                entry.path().is_file()
-                    && entry.path().extension().map_or(false, |ext| ext == "json")
+                entry.path().is_file() && entry.path().extension().is_some_and(|ext| ext == "json")
             })
             .collect();
 
@@ -505,7 +476,7 @@ impl NoteStorage {
 
         if file_path.exists() {
             debug!("Note file exists at: {}", file_path.display());
-            match self.load_note_from_file(&file_path) {
+            match load_note_from_file(&file_path) {
                 Ok(note) => {
                     // Update cache with the found note
                     if let Ok(mut cache) = self.notes_cache.lock() {
@@ -929,7 +900,7 @@ impl NoteStorage {
             }
 
             // Try to extract and restore the note
-            match self.restore_note_from_zip(&mut archive, &file_path, &note_id) {
+            match self.restore_note_from_zip(&mut archive, &file_path, note_id) {
                 Ok(_) => {
                     notes_restored += 1;
                 }
@@ -999,54 +970,841 @@ impl NoteStorage {
         Ok(())
     }
 
-    /// Initializes the file system watcher.
+    /// Initializes the watcher and starts the event handling in the background
+    async fn init_watcher_with_background_task(&mut self) -> Result<()> {
+        // Only initialize once
+        if self.watcher.is_some() {
+            debug!("File system watcher already initialized");
+            return Ok(());
+        }
+
+        // Create a standard mpsc channel for notify crate
+        let (std_tx, std_rx) = std_mpsc::channel();
+
+        // Create a tokio mpsc channel for async event handling
+        let (tx, mut rx) = mpsc::channel(100);
+
+        // Initialize the watcher with the std_tx channel
+        let mut watcher: RecommendedWatcher = Watcher::new(
+            std_tx,
+            notify::Config::default().with_poll_interval(Duration::from_secs(2)),
+        )
+        .map_err(|e| {
+            KbError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to create file watcher: {}", e),
+            ))
+        })?;
+
+        // Start watching the notes directory
+        watcher
+            .watch(self.config.notes_dir.as_ref(), RecursiveMode::Recursive)
+            .map_err(|e| {
+                KbError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to watch directory: {}", e),
+                ))
+            })?;
+
+        // Store the watcher in the struct field
+        self.watcher = Some(watcher);
+
+        // Set up references for the event handler
+        let notes_cache = Arc::clone(&self.notes_cache);
+        // let notes_dir = self.config.notes_dir.clone();
+
+        // Spawn a background task to bridge the standard channel to tokio channel
+        tokio::spawn(async move {
+            // This task will run until the std_rx channel is closed
+            // (which happens when the watcher is dropped)
+            while let Ok(event) = std_rx.recv() {
+                match tx.send(event).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("Failed to forward file system event: {}", e);
+                        break;
+                    }
+                }
+            }
+            debug!("File system event bridge task stopped");
+        });
+
+        // Spawn a task to handle the events from tokio channel
+        tokio::spawn(async move {
+            debug!("File system watcher event handler task started");
+
+            while let Some(event) = rx.recv().await {
+                match event {
+                    Ok(event) => {
+                        debug!("File system event: {:?}", event.kind);
+                        handle_fs_event(event, &notes_cache).await;
+                    }
+                    Err(e) => error!("File system watcher error: {}", e),
+                }
+            }
+
+            debug!("File system watcher event handler task stopped");
+        });
+
+        info!(
+            "File system watcher initialized for directory: {}",
+            self.config.notes_dir.display()
+        );
+        Ok(())
+    }
+
+    /// Deletes a note from both the file system and the in-memory cache
     ///
-    /// This method sets up the watcher to monitor the notes directory
-    /// for changes to note files.
+    /// # Arguments
+    ///
+    /// * `note_id` - The ID of the note to delete
+    ///
+    /// # Returns
+    ///
+    /// A Result indicating success or an error (e.g., if the note doesn't exist)
+    pub fn delete_note(&self, note_id: &str) -> Result<()> {
+        info!("Deleting note: {}", note_id);
+
+        // First, retrieve the note to make a backup before deletion
+        let note_to_delete = match self.get_note(note_id) {
+            Some(note) => note,
+            None => {
+                let error_msg = format!("Cannot delete note {}: Note not found", note_id);
+                error!("{}", error_msg);
+                return Err(KbError::NoteNotFound {
+                    id: note_id.to_string(),
+                });
+            }
+        };
+
+        // Create pre-deletion backup if auto_backup is enabled
+        if self.config.auto_backup {
+            debug!("Creating pre-deletion backup for note: {}", note_id);
+
+            // Ensure backup directory exists
+            if !self.config.backup_dir.exists() {
+                debug!("Creating backup directory for pre-deletion backup");
+                if let Err(e) = fs::create_dir_all(&self.config.backup_dir) {
+                    warn!(
+                        "Failed to create backup directory for pre-deletion backup: {}",
+                        e
+                    );
+                    // Continue with deletion even if backup creation fails
+                }
+            }
+
+            // Create a timestamped pre-deletion backup
+            let timestamp = Utc::now().timestamp();
+            let backup_filename = format!("{}_predeletion_{}.json", note_id, timestamp);
+            let backup_path = self.config.backup_dir.join(backup_filename);
+
+            // Serialize and save the backup
+            match serde_json::to_string_pretty(&note_to_delete) {
+                Ok(json) => {
+                    if let Err(e) = fs::write(&backup_path, json) {
+                        warn!("Failed to write pre-deletion backup: {}", e);
+                        // Continue with deletion even if backup creation fails
+                    } else {
+                        debug!("Pre-deletion backup created at: {}", backup_path.display());
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to serialize note for pre-deletion backup: {}", e);
+                    // Continue with deletion even if backup creation fails
+                }
+            }
+        }
+
+        // Get the file path for the note
+        let file_path = self.get_note_path(note_id);
+
+        // Delete from filesystem
+        if file_path.exists() {
+            debug!("Deleting note file: {}", file_path.display());
+            match fs::remove_file(&file_path) {
+                Ok(_) => {
+                    debug!("Note file deleted successfully");
+                    // Track directories to check for cleanup
+                    let mut dirs_to_check = Vec::new();
+
+                    // Add parent directory to cleanup list if it's not the root notes directory
+                    if let Some(parent) = file_path.parent() {
+                        if parent != self.config.notes_dir {
+                            dirs_to_check.push(parent.to_path_buf());
+                        }
+                    }
+
+                    // Recursively clean up empty parent directories
+                    for dir_path in dirs_to_check {
+                        self.cleanup_empty_directory(&dir_path);
+                    }
+                }
+                Err(e) => {
+                    let error_msg =
+                        format!("Failed to delete note file {}: {}", file_path.display(), e);
+                    error!("{}", error_msg);
+                    return Err(KbError::Io(e));
+                }
+            }
+        } else {
+            debug!("Note file doesn't exist on disk, only removing from cache");
+        }
+
+        // Remove from cache
+        match self.notes_cache.lock() {
+            Ok(mut cache) => {
+                cache.remove(note_id);
+                debug!("Note removed from cache");
+            }
+            Err(e) => {
+                // Since we've already deleted the file, just log this error but don't fail
+                warn!(
+                    "Failed to acquire lock to update cache after deletion: {}",
+                    e
+                );
+            }
+        }
+
+        // Create a deletion record in the backup directory if auto_backup is enabled
+        if self.config.auto_backup {
+            debug!("Creating deletion record in backup directory");
+            let timestamp = Utc::now().timestamp();
+            let deletion_record_path = self
+                .config
+                .backup_dir
+                .join(format!("{}_deletion_record_{}.txt", note_id, timestamp));
+
+            // Create a detailed deletion record with metadata
+            let record = format!(
+                "Deletion Record\n\
+             Note ID: {}\n\
+             Title: {}\n\
+             Tags: {}\n\
+             Created at: {}\n\
+             Last updated: {}\n\
+             Deleted at: {}\n\
+             Content length: {} characters",
+                note_to_delete.id,
+                note_to_delete.title,
+                note_to_delete.tags.join(", "),
+                note_to_delete.created_at.to_rfc3339(),
+                note_to_delete.updated_at.to_rfc3339(),
+                Utc::now().to_rfc3339(),
+                note_to_delete.content.len()
+            );
+
+            if let Err(e) = fs::write(&deletion_record_path, record) {
+                warn!("Failed to create deletion record: {}", e);
+                // Continue since this is just a record
+            } else {
+                debug!(
+                    "Deletion record created at: {}",
+                    deletion_record_path.display()
+                );
+            }
+        }
+
+        info!("Note {} successfully deleted", note_id);
+        Ok(())
+    }
+
+    /// Helper method to recursively clean up empty directories
+    ///
+    /// Checks if a directory is empty and removes it if it is.
+    /// Then checks its parent directory and does the same recursively.
+    fn cleanup_empty_directory(&self, dir_path: &Path) {
+        // Skip if this is the root notes directory or doesn't exist
+        if !dir_path.exists() || dir_path == self.config.notes_dir {
+            return;
+        }
+
+        // Check if the directory is empty
+        match fs::read_dir(dir_path) {
+            Ok(entries) => {
+                if entries.count() == 0 {
+                    debug!("Removing empty directory: {}", dir_path.display());
+                    match fs::remove_dir(dir_path) {
+                        Ok(_) => {
+                            // Recursively check parent directory
+                            if let Some(parent) = dir_path.parent() {
+                                if parent != self.config.notes_dir {
+                                    self.cleanup_empty_directory(parent);
+                                }
+                            }
+                        }
+                        Err(e) => warn!(
+                            "Failed to remove empty directory {}: {}",
+                            dir_path.display(),
+                            e
+                        ),
+                    }
+                }
+            }
+            Err(e) => warn!("Failed to read directory {}: {}", dir_path.display(), e),
+        }
+    }
+
+    /// Updates an existing note with new content
+    ///
+    /// This method ensures the update is applied consistently to both the file system
+    /// and in-memory cache, while maintaining data integrity with atomic operations.
+    ///
+    /// # Arguments
+    ///
+    /// * `updated_note` - The note with updated content
+    ///
+    /// # Returns
+    ///
+    /// A Result indicating success or an error (e.g., if the note doesn't exist)
+    pub fn update_note(&self, updated_note: Note) -> Result<()> {
+        let note_id = updated_note.id.clone();
+        info!("Updating note: {}", note_id);
+
+        // Verify that the note exists before updating
+        let original_note = match self.get_note(&note_id) {
+            Some(note) => note,
+            None => {
+                let error_msg = format!("Cannot update note {}: Note not found", note_id);
+                error!("{}", error_msg);
+                return Err(KbError::NoteNotFound { id: note_id });
+            }
+        };
+
+        // Validate update integrity - ensure we're not changing immutable fields
+        if updated_note.id != original_note.id {
+            let error_msg = "Cannot change note ID during update".to_string();
+            error!("{}", error_msg);
+            return Err(KbError::ApplicationError { message: error_msg });
+        }
+
+        if updated_note.created_at != original_note.created_at {
+            let error_msg = "Cannot change note creation timestamp during update".to_string();
+            error!("{}", error_msg);
+            return Err(KbError::ApplicationError { message: error_msg });
+        }
+
+        // Create pre-update backup if auto_backup is enabled
+        if self.config.auto_backup {
+            debug!("Creating pre-update backup for note: {}", note_id);
+            self.create_update_backup(&original_note, "pre_update")?;
+        }
+
+        // Generate the file path for the note
+        let file_path = self.get_note_path(&note_id);
+        debug!("File path for note update: {}", file_path.display());
+
+        // Ensure the parent directory exists
+        if let Some(parent) = file_path.parent() {
+            if !parent.exists() {
+                debug!("Creating parent directory: {}", parent.display());
+                fs::create_dir_all(parent).map_err(|e| {
+                    error!("Failed to create directory {}: {}", parent.display(), e);
+                    KbError::Io(e)
+                })?;
+            }
+        }
+
+        // Create a temporary file for atomic update
+        let dir = file_path.parent().unwrap_or_else(|| Path::new("."));
+        debug!("Creating temporary file in directory: {}", dir.display());
+        let mut temp_file = NamedTempFile::new_in(dir).map_err(|e| {
+            error!("Failed to create temporary file for update: {}", e);
+            KbError::Io(e)
+        })?;
+
+        // Serialize the updated note to JSON
+        trace!("Serializing updated note to JSON");
+        let json = serde_json::to_string_pretty(&updated_note).map_err(|e| {
+            error!("Failed to serialize updated note: {}", e);
+            KbError::Serialization(e)
+        })?;
+
+        // Write to the temporary file
+        trace!("Writing updated note to temporary file");
+        temp_file.write_all(json.as_bytes()).map_err(|e| {
+            error!("Failed to write to temporary file for update: {}", e);
+            KbError::Io(e)
+        })?;
+
+        temp_file.flush().map_err(|e| {
+            error!("Failed to flush temporary file for update: {}", e);
+            KbError::Io(e)
+        })?;
+
+        // Atomically replace the existing file with the updated content
+        debug!("Performing atomic replace of note file");
+        temp_file.persist(&file_path).map_err(|e| {
+            error!(
+                "Failed to replace file {}: {}",
+                file_path.display(),
+                e.error
+            );
+            KbError::Io(e.error)
+        })?;
+
+        // Update the in-memory cache
+        match self.notes_cache.lock() {
+            Ok(mut cache) => {
+                debug!("Updating note in cache");
+                cache.insert(note_id.clone(), updated_note.clone());
+                trace!("Cache updated successfully");
+            }
+            Err(e) => {
+                warn!("Failed to acquire lock for cache update: {}", e);
+                // We continue since the file update was successful
+                // The file watcher should eventually update the cache
+            }
+        }
+
+        // Create post-update backup if auto_backup is enabled
+        if self.config.auto_backup {
+            debug!("Creating post-update backup for note: {}", note_id);
+            self.create_update_backup(&updated_note, "post_update")?;
+        }
+
+        info!("Note {} updated successfully", note_id);
+        Ok(())
+    }
+
+    /// Creates a backup for a note during update operations
+    ///
+    /// # Arguments
+    ///
+    /// * `note` - The note to back up
+    /// * `stage` - The update stage (e.g., "pre_update", "post_update")
     ///
     /// # Returns
     ///
     /// A Result indicating success or an error
-    fn init_watcher(&mut self) -> Result<()> {
-        info!(
-            "Initializing file system watcher for: {}",
-            self.config.notes_dir.display()
-        );
+    fn create_update_backup(&self, note: &Note, stage: &str) -> Result<PathBuf> {
+        debug!("Creating {} backup for note: {}", stage, note.id);
 
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            match res {
-                Ok(event) => {
-                    debug!("File system event detected: {:?}", event);
-                    // File system event occurred
-                    // We'll process it in a future implementation
-                }
-                Err(e) => {
-                    error!("Error in file watcher: {}", e);
-                }
-            }
-        })
-        .map_err(|e| {
-            error!("Failed to create file watcher: {}", e);
-            KbError::ApplicationError {
-                message: format!("Failed to create file watcher: {}", e),
-            }
+        // Ensure backup directory exists
+        if !self.config.backup_dir.exists() {
+            debug!("Creating backup directory for update backup");
+            fs::create_dir_all(&self.config.backup_dir).map_err(|e| {
+                warn!("Failed to create backup directory for update backup: {}", e);
+                KbError::Io(e)
+            })?;
+        }
+
+        // Create a timestamped backup filename
+        let timestamp = Utc::now().timestamp();
+        let backup_filename = format!(
+            "{}_{}_{}_{}.json",
+            note.id,
+            stage,
+            timestamp,
+            note.updated_at.timestamp()
+        );
+        let backup_path = self.config.backup_dir.join(backup_filename);
+
+        // Serialize and save the backup
+        let json = serde_json::to_string_pretty(&note).map_err(|e| {
+            warn!("Failed to serialize note for update backup: {}", e);
+            KbError::Serialization(e)
         })?;
 
-        debug!("Setting up recursive watching on notes directory");
-        watcher
-            .watch(&self.config.notes_dir, RecursiveMode::Recursive)
-            .map_err(|e| {
-                error!("Failed to watch notes directory: {}", e);
-                KbError::ApplicationError {
-                    message: format!("Failed to watch notes directory: {}", e),
-                }
-            })?;
+        fs::write(&backup_path, json).map_err(|e| {
+            warn!("Failed to write update backup: {}", e);
+            KbError::Io(e)
+        })?;
 
-        // Store the watcher
-        self.watcher = Some(watcher);
-        info!("File system watcher successfully initialized");
+        debug!("Update backup created at: {}", backup_path.display());
+        Ok(backup_path)
+    }
+
+    // Updates a note with optimistic concurrency control to prevent conflicts
+    ///
+    /// This method ensures that updates only occur if the note has not been modified
+    /// by another process since it was last read, preventing accidental overwrites.
+    ///
+    /// # Arguments
+    ///
+    /// * `updated_note` - The note with updated content
+    /// * `expected_version` - The expected current version info (ID and timestamp)
+    ///
+    /// # Returns
+    ///
+    /// A Result indicating success or an error (e.g., if the note doesn't exist or was modified)
+    pub fn update_note_with_version(
+        &self,
+        updated_note: Note,
+        expected_version: NoteVersion,
+    ) -> Result<()> {
+        let note_id = updated_note.id.clone();
+        info!("Updating note with version check: {}", note_id);
+
+        // Verify note IDs match
+        if note_id != expected_version.id {
+            let error_msg = "Version check failed: Note ID mismatch".to_string();
+            error!("{}", error_msg);
+            return Err(KbError::ApplicationError { message: error_msg });
+        }
+
+        // Retrieve current note state
+        let current_note = match self.get_note(&note_id) {
+            Some(note) => note,
+            None => {
+                let error_msg = format!("Cannot update note {}: Note not found", note_id);
+                error!("{}", error_msg);
+                return Err(KbError::NoteNotFound { id: note_id });
+            }
+        };
+
+        // Check if the note has been modified since it was last read
+        if current_note.updated_at != expected_version.updated_at {
+            let error_msg = format!(
+                "Concurrent modification detected for note {}: Expected timestamp {}, found {}",
+                note_id, expected_version.updated_at, current_note.updated_at
+            );
+            warn!("{}", error_msg);
+
+            return Err(KbError::ConcurrentModification {
+                id: note_id,
+                expected_timestamp: expected_version.updated_at,
+                actual_timestamp: current_note.updated_at,
+            });
+        }
+
+        // Validate update integrity - ensure we're not changing immutable fields
+        if updated_note.id != current_note.id {
+            return Err(KbError::ApplicationError {
+                message: "Cannot change note ID during update".to_string(),
+            });
+        }
+
+        if updated_note.created_at != current_note.created_at {
+            return Err(KbError::ApplicationError {
+                message: "Cannot change note creation timestamp during update".to_string(),
+            });
+        }
+
+        // Create pre-update backup if auto_backup is enabled
+        if self.config.auto_backup {
+            debug!("Creating pre-update backup for note: {}", note_id);
+            match self.create_update_backup(&current_note, "pre_update") {
+                Ok(path) => debug!("Pre-update backup created at: {}", path.display()),
+                Err(e) => warn!("Failed to create pre-update backup: {}", e),
+                // Continue with update even if backup fails
+            }
+        }
+
+        // Generate the file path for the note
+        let file_path = self.get_note_path(&note_id);
+        debug!("File path for note update: {}", file_path.display());
+
+        // Ensure the parent directory exists
+        if let Some(parent) = file_path.parent() {
+            if !parent.exists() {
+                debug!("Creating parent directory: {}", parent.display());
+                fs::create_dir_all(parent).map_err(|e| {
+                    error!("Failed to create directory {}: {}", parent.display(), e);
+                    KbError::Io(e)
+                })?;
+            }
+        }
+
+        // Create a temporary file for atomic update
+        let dir = file_path.parent().unwrap_or_else(|| Path::new("."));
+        debug!("Creating temporary file in directory: {}", dir.display());
+        let mut temp_file = NamedTempFile::new_in(dir).map_err(|e| {
+            error!("Failed to create temporary file for update: {}", e);
+            KbError::Io(e)
+        })?;
+
+        // Serialize the updated note to JSON
+        trace!("Serializing updated note to JSON");
+        let json = serde_json::to_string_pretty(&updated_note).map_err(|e| {
+            error!("Failed to serialize updated note: {}", e);
+            KbError::Serialization(e)
+        })?;
+
+        // Write to the temporary file
+        trace!("Writing updated note to temporary file");
+        temp_file.write_all(json.as_bytes()).map_err(|e| {
+            error!("Failed to write to temporary file for update: {}", e);
+            KbError::Io(e)
+        })?;
+
+        temp_file.flush().map_err(|e| {
+            error!("Failed to flush temporary file for update: {}", e);
+            KbError::Io(e)
+        })?;
+
+        // Start critical section - update both storage mechanisms atomically
+        // First, update the file system
+        debug!("Performing atomic replace of note file");
+        temp_file.persist(&file_path).map_err(|e| {
+            error!(
+                "Failed to replace file {}: {}",
+                file_path.display(),
+                e.error
+            );
+            KbError::Io(e.error)
+        })?;
+
+        // Then update the in-memory cache
+        match self.notes_cache.lock() {
+            Ok(mut cache) => {
+                debug!("Updating note in cache");
+                // Double-check version before updating cache
+                if let Some(cached_note) = cache.get(&note_id) {
+                    if cached_note.updated_at != expected_version.updated_at {
+                        // Another process updated the note after our file update!
+                        // This is rare but could happen in a multi-process environment
+                        warn!(
+                            "Detected concurrent modification during cache update for note {}",
+                            note_id
+                        );
+                        // We won't fail here since the file is already updated
+                        // Our file watcher should eventually reconcile this
+                    }
+                }
+                cache.insert(note_id.clone(), updated_note.clone());
+                trace!("Cache updated successfully");
+            }
+            Err(e) => {
+                warn!("Failed to acquire lock for cache update: {}", e);
+                // We continue since the file update was successful
+                // The file watcher should eventually update the cache
+            }
+        }
+
+        // Create post-update backup if auto_backup is enabled
+        if self.config.auto_backup {
+            debug!("Creating post-update backup for note: {}", note_id);
+            match self.create_update_backup(&updated_note, "post_update") {
+                Ok(path) => debug!("Post-update backup created at: {}", path.display()),
+                Err(e) => warn!("Failed to create post-update backup: {}", e),
+                // Continue even if backup fails
+            }
+        }
+
+        info!("Note {} updated successfully with version check", note_id);
+        Ok(())
+    }
+
+    /// Retrieves a note by its ID from the storage, including version information for concurrency control
+    /// Returns tuple of (Note, NoteVersion) if found, or None if not found
+    pub fn get_note_with_version(&self, note_id: &str) -> Option<(Note, NoteVersion)> {
+        match self.get_note(note_id) {
+            Some(note) => {
+                // Create a version object for concurrency control
+                let version = NoteVersion {
+                    id: note.id.clone(),
+                    updated_at: note.updated_at,
+                };
+                Some((note, version))
+            }
+            None => None,
+        }
+    }
+
+    /// Attempts to resolve a concurrent modification conflict
+    ///
+    /// # Arguments
+    ///
+    /// * `client_note` - The note with client updates
+    /// * `server_note` - The current note on the server
+    ///
+    /// # Returns
+    ///
+    /// A ConflictResolution indicating how to proceed
+    pub fn resolve_conflict(
+        &self,
+        client_note: &Note,
+        server_note: &Note,
+    ) -> Result<ConflictResolution> {
+        // This is a simple implementation that could be expanded with more sophisticated merging
+
+        // If only the content was changed in both versions, try to merge
+        if client_note.title == server_note.title && client_note.tags == server_note.tags {
+            // Simple content merge - more sophisticated merging could be implemented
+            let mut merged_note = server_note.clone();
+            merged_note.content = format!(
+                "{}\n\n--- MERGED CONTENT FROM CONCURRENT UPDATE ---\n\n{}",
+                server_note.content, client_note.content
+            );
+            merged_note.updated_at = Utc::now();
+
+            return Ok(ConflictResolution::UseMergedVersion(merged_note));
+        }
+
+        // If everything but the timestamp is identical, use the server version
+        // (this happens when the client didn't actually change anything meaningful)
+        if client_note.title == server_note.title
+            && client_note.content == server_note.content
+            && client_note.tags == server_note.tags
+        {
+            return Ok(ConflictResolution::UseServerVersion);
+        }
+
+        // Otherwise, we can't automatically resolve
+        Ok(ConflictResolution::Unresolved)
+    }
+
+    /// Stops the file system watcher and releases its resources
+    ///
+    /// This method ensures that the watcher is properly shut down
+    /// and all associated background tasks are terminated.
+    ///
+    /// # Returns
+    ///
+    /// A Result indicating success or an error
+    pub async fn stop_watcher(&mut self) -> Result<()> {
+        info!("Stopping file system watcher...");
+
+        // Check if the watcher is running
+        if let Some(watcher) = self.watcher.take() {
+            debug!("File watcher instance found, shutting down");
+
+            // Drop the watcher, which closes its channels and stops watching
+            drop(watcher);
+
+            // Wait for a short time to allow background tasks to clean up
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                    debug!("Waited for background tasks to clean up");
+                }
+            }
+
+            info!("File system watcher stopped successfully");
+        } else {
+            debug!("No active file watcher to stop");
+        }
 
         Ok(())
+    }
+
+    /// Performs a complete shutdown of the storage system, including
+    /// stopping the file watcher and backup scheduler
+    ///
+    /// # Returns
+    ///
+    /// A Result indicating success or an error
+    /// Performs a complete shutdown of the storage system, including
+    /// stopping the file watcher and backup scheduler
+    ///
+    /// # Returns
+    ///
+    /// A Result indicating success or an error
+    pub async fn shutdown(&mut self) -> Result<()> {
+        info!("Shutting down NoteStorage...");
+
+        // Set a shutdown flag to prevent new operations
+        self.initialized = false;
+
+        // Track any errors during shutdown
+        let mut shutdown_errors = Vec::new();
+
+        // First, stop the backup scheduler to prevent new backup operations
+        match self.stop_backup_scheduler().await {
+            Ok(_) => debug!("Backup scheduler stopped successfully"),
+            Err(e) => {
+                let error_msg = format!("Error stopping backup scheduler: {}", e);
+                warn!("{}", error_msg);
+                shutdown_errors.push(error_msg);
+                // Continue with shutdown despite this error
+            }
+        }
+
+        // Next, stop the file watcher
+        match self.stop_watcher().await {
+            Ok(_) => debug!("File watcher stopped successfully"),
+            Err(e) => {
+                let error_msg = format!("Error stopping file watcher: {}", e);
+                warn!("{}", error_msg);
+                shutdown_errors.push(error_msg);
+                // Continue with shutdown despite this error
+            }
+        }
+
+        // Perform final operations before shutdown
+
+        // Flush any pending changes with timeout
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.flush_cache_to_disk(),
+        )
+        .await
+        {
+            Ok(result) => {
+                if let Err(e) = result {
+                    let error_msg = format!("Error flushing cache to disk: {}", e);
+                    warn!("{}", error_msg);
+                    shutdown_errors.push(error_msg);
+                } else {
+                    debug!("Cache flushed successfully");
+                }
+            }
+            Err(_) => {
+                let error_msg = "Timed out while flushing cache to disk";
+                warn!("{}", error_msg);
+                shutdown_errors.push(error_msg.to_string());
+            }
+        }
+
+        // Final shutdown status report
+        if shutdown_errors.is_empty() {
+            info!("NoteStorage shutdown complete - all components shut down cleanly");
+            Ok(())
+        } else {
+            let error_msg = format!(
+                "NoteStorage shutdown completed with {} errors",
+                shutdown_errors.len()
+            );
+            warn!("{}", error_msg);
+            Err(KbError::ApplicationError { message: error_msg })
+        }
+    }
+
+    /// Flush in-memory cache to disk to ensure all changes are persisted
+    ///
+    /// This is useful during shutdown or when synchronization is needed.
+    ///
+    /// # Returns
+    ///
+    /// A Result indicating success or an error
+    async fn flush_cache_to_disk(&self) -> Result<()> {
+        debug!("Flushing cache to disk...");
+
+        let notes = {
+            match self.notes_cache.lock() {
+                Ok(cache) => {
+                    // Clone notes for processing outside of lock
+                    cache.values().cloned().collect::<Vec<Note>>()
+                }
+                Err(e) => {
+                    warn!("Failed to acquire cache lock during flush: {}", e);
+                    return Err(KbError::LockAcquisitionFailed {
+                        message: "Failed to acquire lock during flush operation".to_string(),
+                    });
+                }
+            }
+        };
+
+        // Track any errors during flush
+        let mut error_count = 0;
+
+        // Save each note to ensure it's on disk
+        for note in notes {
+            if let Err(e) = self.save_note(&note) {
+                error_count += 1;
+                warn!("Failed to flush note {}: {}", note.id, e);
+                // Continue with other notes despite this error
+            }
+        }
+
+        if error_count > 0 {
+            warn!("Completed cache flush with {} errors", error_count);
+            Err(KbError::ApplicationError {
+                message: format!("Failed to flush {} notes during shutdown", error_count),
+            })
+        } else {
+            debug!("Cache flush completed successfully");
+            Ok(())
+        }
     }
 }
 

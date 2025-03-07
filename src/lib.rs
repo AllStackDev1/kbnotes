@@ -1,15 +1,16 @@
 //! Knowledge Base Note-taking application library
-//! 
+//!
 //! This library provides functionality for creating, storing, searching, and managing notes
 //! with tags and content in Markdown format.
 
-mod types;
+mod backup_scheduler;
 mod errors;
+mod helper;
 mod storage;
-mod backup_scheduler; // Add the new module
+mod types; // Add the new module
 
 // Re-export key components
-pub use types::{Note, Config};
-pub use errors::{Result, KbError};
-pub use storage::NoteStorage;
-pub use backup_scheduler::{BackupScheduler, BackupSchedulerStatus};
+pub use backup_scheduler::*;
+pub use errors::*;
+pub use storage::*;
+pub use types::*;

@@ -5,6 +5,8 @@
 
 use std::io;
 use std::path::PathBuf;
+
+use chrono::{DateTime, Utc};
 use thiserror::Error;
 
 /// The main error type for the kbnotes application.
@@ -45,18 +47,25 @@ pub enum KbError {
     /// Directory creation or access failed.
     #[error("Failed to create or access directory: {path}")]
     DirectoryError { path: PathBuf },
-    
+
     /// Error when attempting to restore from backup.
     #[error("Restore failed: {message}")]
     RestoreFailed { message: String },
-    
+
     /// Generic application error with a custom message.
     #[error("{message}")]
     ApplicationError { message: String },
 
     /// for mutex lock acquisition issues
     #[error("{message}")]
-    LockAcquisitionFailed  { message: String },
+    LockAcquisitionFailed { message: String },
+
+    #[error("Concurrent modification detected for note {id}: Expected timestamp {expected_timestamp}, found {actual_timestamp}")]
+    ConcurrentModification {
+        id: String,
+        expected_timestamp: DateTime<Utc>,
+        actual_timestamp: DateTime<Utc>,
+    },
 }
 
 /// A specialized Result type for kbnotes operations.

@@ -13,14 +13,6 @@ use crate::types::Config;
 use crate::NoteStorage;
 
 #[derive(Debug, Clone)]
-pub enum BackupCommand {
-    /// Create a full backup immediately
-    CreateBackupNow,
-    /// Stop the backup scheduler
-    Stop,
-}
-
-#[derive(Debug, Clone)]
 pub struct BackupSchedulerStatus {
     /// Whether the scheduler is running
     pub is_running: bool,
@@ -28,6 +20,14 @@ pub struct BackupSchedulerStatus {
     pub last_backup_time: Option<chrono::DateTime<Utc>>,
     /// The path to the last backup file
     pub last_backup_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub enum BackupCommand {
+    /// Create a full backup immediately
+    CreateBackupNow,
+    /// Stop the backup scheduler
+    Stop,
 }
 
 pub struct BackupScheduler {
