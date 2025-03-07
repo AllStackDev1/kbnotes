@@ -18,6 +18,10 @@ pub enum KbError {
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
+    /// Errors related to zip operations.
+    #[error("Zip error: {0}")]
+    ZipError(#[from] zip::result::ZipError),
+
     /// Note was not found when performing an operation.
     #[error("Note not found: {id}")]
     NoteNotFound { id: String },
@@ -49,6 +53,10 @@ pub enum KbError {
     /// Generic application error with a custom message.
     #[error("{message}")]
     ApplicationError { message: String },
+
+    /// for mutex lock acquisition issues
+    #[error("{message}")]
+    LockAcquisitionFailed  { message: String },
 }
 
 /// A specialized Result type for kbnotes operations.

@@ -1,8 +1,6 @@
 use log::info;
 
-mod error;
-mod storage;
-mod types;
+use kbnotes::{NoteStorage};
 
 pub fn initialize_logger() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
