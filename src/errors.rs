@@ -66,7 +66,11 @@ pub enum KbError {
         expected_timestamp: DateTime<Utc>,
         actual_timestamp: DateTime<Utc>,
     },
-}
 
-/// A specialized Result type for kbnotes operations.
-pub type Result<T> = std::result::Result<T, KbError>;
+    /// file not found
+    #[error("File not found: {file_path}")]
+    FileNotFound { file_path: String },
+
+    #[error("{message}")]
+    EditorError { message: String },
+}

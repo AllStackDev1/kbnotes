@@ -1,13 +1,14 @@
+use std::fs;
 use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
 
-use clap::{Arg, Command};
+use clap::Parser;
 use env_logger::Env;
 use log::{debug, error, info, warn};
 use tokio::sync::Mutex;
 
-use kbnotes::{Config, KbError, NoteStorage, Result};
+use kbnotes::{Cli, App as CliApp, Config, KbError, NoteStorage, Result};
 
 #[tokio::main]
 async fn main() {
@@ -18,46 +19,13 @@ async fn main() {
 
     info!("KBNotes application starting...");
 
-    // Parse command-line arguments using clap
-    let matches = Command::new("KBNotes")
-        .version("1.0.0")
-        .author("Your Name <your.email@example.com>")
-        .about("Knowledge Base and Note-taking Application")
-        .arg(
-            Arg::new("config")
-                .short('c')
-                .long("config")
-                .value_name("FILE")
-                .help("Sets a custom config file path")
-                .value_parser(clap::value_parser!(String)),
-        )
-        .arg(
-            Arg::new("notes-dir")
-                .long("notes-dir")
-                .value_name("DIRECTORY")
-                .help("Sets the notes directory")
-                .value_parser(clap::value_parser!(String)),
-        )
-        .arg(
-            Arg::new("backup-dir")
-                .long("backup-dir")
-                .value_name("DIRECTORY")
-                .help("Sets the backup directory")
-                .value_parser(clap::value_parser!(String)),
-        )
-        .get_matches();
+    // Parse CLI arguments using the derived structure
+    let cli = Cli::parse();
 
     // Initialize the storage system
-    match initialize_storage(&matches).await {
-        Ok(storage) => {
+    match initialize_storage(&cli).await {
+        Ok((storage, config)) => {
             info!("NoteStorage initialized successfully");
-
-            // Here you would start your application's main logic
-            // For example, launch a CLI interface, API server, etc.
-
-            // For demonstration, let's just print some stats
-            /* let note_count = storage
-            .lock() */
 
             // Get backup status
             let backup_status = storage.lock().await.get_backup_status().await;
@@ -70,8 +38,11 @@ async fn main() {
                 }
             );
 
+            // Set up ctrl-c handler for graceful shutdown
+            setup_signal_handler(storage.clone());
+
             // Run the application until terminated
-            run_application(storage).await;
+            run_application(storage.clone(), config, cli).await;
         }
         Err(e) => {
             error!("Failed to initialize storage: {}", e);
@@ -81,9 +52,9 @@ async fn main() {
 }
 
 /// Initialize the storage system with configuration
-async fn initialize_storage(matches: &clap::ArgMatches) -> Result<Arc<Mutex<NoteStorage>>> {
+async fn initialize_storage(cli: &Cli) -> Result<(Arc<Mutex<NoteStorage>>, Config)> {
     // Step 1: Load configuration
-    let config = load_configuration(matches)?;
+    let config = load_configuration(cli)?;
     info!("Configuration loaded successfully");
 
     // Step 2: Create the storage instance
@@ -100,33 +71,38 @@ async fn initialize_storage(matches: &clap::ArgMatches) -> Result<Arc<Mutex<Note
         .await?;
 
     // Return the initialized storage instance
-    Ok(storage_arc)
+    Ok((storage_arc, config))
 }
 
 /// Load configuration from file and/or command-line arguments
-fn load_configuration(matches: &clap::ArgMatches) -> Result<Config> {
+fn load_configuration(cli: &Cli) -> Result<Config> {
     // Default configuration
     let mut config = load_default_config()?;
     // Override with config file if specified
-    if let Some(config_path) = matches.get_one::<String>("config") {
+    if let Some(config_path) = &cli.config {
         match load_config_from_file(config_path) {
             Ok(file_config) => {
-                info!("Loaded configuration from file: {}", config_path);
+                info!("Loaded configuration from file: {}", config_path.display());
                 config = file_config;
             }
             Err(e) => {
-                warn!("Failed to load configuration from {}: {}", config_path, e);
+                warn!(
+                    "Failed to load configuration from {}: {}",
+                    config_path.display(),
+                    e
+                );
                 warn!("Falling back to default configuration");
             }
         }
     }
+
     // Override with command-line arguments
-    if let Some(notes_dir) = matches.get_one::<String>("notes-dir") {
+    if let Some(notes_dir) = cli.notes_dir.clone() {
         info!("Using notes directory from command line: {}", notes_dir);
         config.notes_dir = PathBuf::from(notes_dir);
     }
 
-    if let Some(backup_dir) = matches.get_one::<String>("backup-dir") {
+    if let Some(backup_dir) = cli.backup_dir.clone() {
         info!("Using backup directory from command line: {}", backup_dir);
         config.backup_dir = PathBuf::from(backup_dir);
     }
@@ -160,7 +136,7 @@ fn load_default_config() -> Result<Config> {
 }
 
 /// Load configuration from a file
-fn load_config_from_file(config_path: &str) -> Result<Config> {
+fn load_config_from_file(config_path: &PathBuf) -> Result<Config> {
     use std::fs;
 
     let config_file = fs::read_to_string(config_path).map_err(KbError::Io)?;
@@ -185,14 +161,12 @@ fn load_config_from_file(config_path: &str) -> Result<Config> {
     // }
 
     Err(KbError::ApplicationError {
-        message: format!("Unsupported config file format: {}", config_path),
+        message: format!("Unsupported config file format: {}", config_path.display()),
     })
 }
 
 /// Validate the configuration for required values and permissions
 fn validate_configuration(config: &Config) -> Result<()> {
-    use std::fs;
-
     // Check if notes directory exists or can be created
     if !config.notes_dir.exists() {
         info!(
@@ -293,7 +267,27 @@ async fn shutdown_application(storage: Arc<Mutex<NoteStorage>>) -> Result<()> {
 }
 
 /// Enhanced application loop with multiple signal handling and proper timeout behavior
-async fn run_application(storage: Arc<Mutex<NoteStorage>>) {
+async fn run_application(storage: Arc<Mutex<NoteStorage>>, config: Config, cli: Cli) {
+    // Your main application logic here
+    info!("Application is running. Press Ctrl+C to exit.");
+
+    // Create our CLI application handler
+    let app = CliApp::new(storage, config, cli.verbose);
+
+    // Run the CLI command
+    match app.run(cli.command).await {
+        Ok(_) => {
+            debug!("Command executed successfully");
+        }
+        Err(e) => {
+            error!("Command execution failed: {}", e);
+            process::exit(1);
+        }
+    }
+}
+
+/// Set up a signal handler for graceful shutdown
+fn setup_signal_handler(storage: Arc<Mutex<NoteStorage>>) {
     // Set up ctrl-c handler which works on all platforms
     tokio::spawn(async move {
         match tokio::signal::ctrl_c().await {
@@ -332,14 +326,4 @@ async fn run_application(storage: Arc<Mutex<NoteStorage>>) {
             Err(e) => error!("Error setting up Ctrl+C handler: {}", e),
         }
     });
-
-    // Your main application logic here
-    info!("Application is running. Press Ctrl+C to exit.");
-
-    // In a real application, you might have a server or event loop here
-    // For demonstration, we'll just wait indefinitely
-    loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        // Your application's main logic would go here
-    }
 }

@@ -1,6 +1,6 @@
 // src/backup_scheduler.rs - Backup scheduler module
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use chrono::Utc;
 use log::{debug, error, info};
@@ -8,9 +8,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
 
-use crate::errors::{KbError, Result};
-use crate::types::Config;
-use crate::NoteStorage;
+use crate::{Config, KbError, NoteStorage, Result};
 
 #[derive(Debug, Clone)]
 pub struct BackupSchedulerStatus {
@@ -33,18 +31,25 @@ pub enum BackupCommand {
 pub struct BackupScheduler {
     /// Configuration for the scheduler
     config: Config,
+
     /// Channel to send commands to the scheduler task
     command_tx: mpsc::Sender<BackupCommand>,
+
     /// Handle to the scheduler task
     scheduler_task: Option<JoinHandle<()>>,
+
     /// Current status of the scheduler
     status: BackupSchedulerStatus,
+
+    /// Weak reference to the storage
+    storage: Option<Weak<Mutex<NoteStorage>>>,
 }
 
 /// Represents the backup scheduler status
 impl BackupScheduler {
     /// Create a new backup scheduler with the provided config
     pub fn new(config: Config) -> Self {
+        info!("Initializing backup scheduler with config: {:?}", config);
         let (command_tx, _) = mpsc::channel(10);
 
         Self {
@@ -56,13 +61,40 @@ impl BackupScheduler {
                 last_backup_time: None,
                 last_backup_path: None,
             },
+            storage: None,
         }
     }
 
-    pub async fn start(&mut self, storage: Arc<Mutex<NoteStorage>>) -> Result<()> {
+    /// Set the weak reference to NoteStorage
+    pub fn set_storage(&mut self, storage: Arc<Mutex<NoteStorage>>) {
+        self.storage = Some(Arc::downgrade(&storage));
+        info!("Storage reference set in BackupScheduler.");
+    }
+
+    /// Star the backup scheduler
+    pub async fn start(&mut self) -> Result<()> {
+        info!("Starting backup scheduler...");
         if !self.config.auto_backup {
             return Ok(()); // No need to start if auto backup is disabled
         }
+
+        let storage = match &self.storage {
+            Some(weak) => match weak.upgrade() {
+                Some(strong) => strong, // Successfully retrieved Arc<Mutex<NoteStorage>>
+                None => {
+                    error!("Failed to retrieve NoteStorage - reference is no longer valid.");
+                    return Err(KbError::ApplicationError {
+                        message: "NoteStorage reference is no longer valid.".to_string(),
+                    });
+                }
+            },
+            None => {
+                error!("No storage reference found in BackupScheduler.");
+                return Err(KbError::ApplicationError {
+                    message: "BackupScheduler does not have a storage reference.".to_string(),
+                });
+            }
+        };
 
         let (command_tx, mut command_rx) = mpsc::channel(10);
         self.command_tx = command_tx;

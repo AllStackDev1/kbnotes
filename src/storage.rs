@@ -14,10 +14,10 @@ use tokio::sync::{mpsc, Mutex as TokioMutex};
 use walkdir::WalkDir;
 use zip::{write::FileOptions, ZipArchive, ZipWriter};
 
-use crate::backup_scheduler::{BackupScheduler, BackupSchedulerStatus};
-use crate::errors::{KbError, Result};
-use crate::helper::{handle_fs_event, load_note_from_file};
-use crate::types::{Config, ConflictResolution, Note, NoteVersion, RestoreBackupSummary};
+use crate::{
+    handle_fs_event, load_note_from_file, BackupScheduler, BackupSchedulerStatus, Config,
+    ConflictResolution, KbError, Note, NoteVersion, RestoreBackupSummary, Result,
+};
 
 /// Manages the storage, retrieval, and synchronization of notes.
 pub struct NoteStorage {
@@ -72,61 +72,61 @@ impl NoteStorage {
 
     /// Initializes the storage system, loading notes and starting backup scheduler
     pub async fn initialize(&mut self, storage: Arc<TokioMutex<NoteStorage>>) -> Result<()> {
-        let mut storage_lock = storage.lock().await;
+        if self.initialized {
+            return Ok(());
+        }
 
         info!(
             "Initializing NoteStorage with config: notes_dir={}, backup_dir={}",
-            storage_lock.config.notes_dir.display(),
-            storage_lock.config.backup_dir.display()
+            self.config.notes_dir.display(),
+            self.config.backup_dir.display()
         );
 
         // Ensure notes directory exists
-        if !storage_lock.config.notes_dir.exists() {
+        if !self.config.notes_dir.exists() {
             debug!(
                 "Notes directory does not exist, creating: {}",
-                storage_lock.config.notes_dir.display()
+                self.config.notes_dir.display()
             );
-            fs::create_dir_all(&storage_lock.config.notes_dir).map_err(|e| {
+            fs::create_dir_all(&self.config.notes_dir).map_err(|e| {
                 error!("Failed to create notes directory: {}", e);
                 KbError::DirectoryError {
-                    path: storage_lock.config.notes_dir.clone(),
+                    path: self.config.notes_dir.clone(),
                 }
             })?;
         }
 
         // Ensure backup directory exists
-        if !storage_lock.config.backup_dir.exists() {
+        if !self.config.backup_dir.exists() {
             debug!(
                 "Backup directory does not exist, creating: {}",
-                storage_lock.config.backup_dir.display()
+                self.config.backup_dir.display()
             );
-            fs::create_dir_all(&storage_lock.config.backup_dir).map_err(|e| {
+            fs::create_dir_all(&self.config.backup_dir).map_err(|e| {
                 error!("Failed to create backup directory: {}", e);
                 KbError::DirectoryError {
-                    path: storage_lock.config.backup_dir.clone(),
+                    path: self.config.backup_dir.clone(),
                 }
             })?;
         }
 
         // Load existing notes into cache
         debug!("Loading notes into storage");
-        storage_lock.load_notes()?;
+        self.load_notes()?;
         info!("Loaded notes successfully");
 
-        // Mark as initialized
-        storage_lock.initialized = true;
+        {
+            let mut scheduler = self.backup_scheduler.lock().await;
+            scheduler.set_storage(Arc::clone(&storage)); // Set weak reference
 
-        // Start the backup scheduler
-        let mut scheduler = storage_lock.backup_scheduler.lock().await;
-        match scheduler.start(storage.clone()).await {
-            Ok(_) => info!("Backup scheduler started successfully"),
-            Err(e) => error!("Failed to start backup scheduler: {}", e),
-        }
+            match scheduler.start().await {
+                Ok(_) => info!("Backup scheduler started successfully"),
+                Err(e) => error!("Failed to start backup scheduler: {}", e),
+            }
+        } // Lock is dropped here explicitly
 
-        drop(scheduler);
-
-        // Initialize the file watcher synchronously but do the actual watching
-        // in a background task
+        // Initialize the file watcher synchronously
+        // but do the actual watching in a background task
         self.init_watcher_with_background_task().await?;
 
         info!("NoteStorage initialization complete");
@@ -1177,13 +1177,13 @@ impl NoteStorage {
             // Create a detailed deletion record with metadata
             let record = format!(
                 "Deletion Record\n\
-             Note ID: {}\n\
-             Title: {}\n\
-             Tags: {}\n\
-             Created at: {}\n\
-             Last updated: {}\n\
-             Deleted at: {}\n\
-             Content length: {} characters",
+                Note ID: {}\n\
+                Title: {}\n\
+                Tags: {}\n\
+                Created at: {}\n\
+                Last updated: {}\n\
+                Deleted at: {}\n\
+                Content length: {} characters",
                 note_to_delete.id,
                 note_to_delete.title,
                 note_to_delete.tags.join(", "),

@@ -2,50 +2,15 @@
 //!
 //! This module contains the primary types used throughout the application,
 //! including Note and Config structures.
-
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use clap::Subcommand;
 
-/// Represents a single note in our system
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Note {
-    /// Unique identifier for the note
-    pub id: String,
-    /// Note title
-    pub title: String,
-    /// Note content in Markdown format
-    pub content: String,
-    /// Tags for organization
-    pub tags: Vec<String>,
-    /// When the note was created
-    pub created_at: DateTime<Utc>,
-    /// Last modification time
-    pub updated_at: DateTime<Utc>,
-}
+use crate::{Note, KbError};
 
-impl Note {
-    /// Creates a new note with the given title and content
-    pub fn new(title: String, content: String, tags: Vec<String>) -> Self {
-        let now = Utc::now();
-        // Generate a unique ID using timestamp and title
-        let id = format!(
-            "{}-{}",
-            now.timestamp_millis(),
-            title.to_lowercase().replace(' ', "-")
-        );
-
-        Note {
-            id,
-            title,
-            content,
-            tags,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-}
+/// A specialized Result type for kbnotes operations.
+pub type Result<T> = std::result::Result<T, KbError>;
 
 /// Represents the expected state of a note for concurrency control
 pub struct NoteVersion {
@@ -82,35 +47,195 @@ pub enum ConflictResolution {
     Unresolved,
 }
 
-/// Application configuration settings.
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Config {
-    /// Directory where notes are stored
-    pub notes_dir: PathBuf,
+/// Available subcommands for the kbnotes application
+#[derive(Subcommand)]
+pub enum Commands {
+    /// Create a new note
+    Create {
+        /// Title of the note
+        #[clap(short = 'T', long)]
+        title: String,
 
-    /// Directory for backups
-    pub backup_dir: PathBuf,
+        /// Content of the note, can be markdown formatted
+        #[clap(short, long)]
+        content: Option<String>,
 
-    /// How often to create backups (in hours)
-    pub backup_frequency: u32,
+        /// Open content in editor before saving
+        #[clap(short, long)]
+        edit: bool,
 
-    /// Maximum number of backups to keep
-    pub max_backups: u32,
+        /// Tags to associate with the note (comma-separated)
+        #[clap(short = 't', long)]
+        tags: Option<String>,
 
-    /// Whether to encrypt notes (for future extension)
-    pub encrypt_notes: bool,
+        /// Path to a file containing the note's content
+        #[clap(short, long)]
+        file: Option<PathBuf>,
+    },
 
-    /// Default editor command (for future extension)
-    pub editor_command: Option<String>,
+    /// View a note by ID
+    View {
+        /// ID of the note to view
+        id: String,
 
-    /// Whether to enable auto-saving (for future extension)
-    pub auto_save: bool,
+        /// Format output as raw JSON
+        #[clap(short, long)]
+        json: bool,
 
-    /// Whether to enable auto-saving (for future extension)
-    pub auto_backup: bool,
-    // /// Auto-save interval in minutes (if auto_save is enabled) (for future extension)
-    // pub auto_save_interval: u32,
+        /// Open in the default editor
+        #[clap(short, long)]
+        edit: bool,
+    },
 
-    // /// Default file format for notes (.md, .txt, etc.) (for future extension)
-    // pub default_format: String,
+    /// List notes with optional filtering
+    List {
+        /// Filter notes by tag
+        #[clap(short, long)]
+        tag: Option<String>,
+
+        /// Limit the number of notes returned
+        #[clap(short = 'n', long, default_value_t = 10)]
+        limit: usize,
+
+        /// Format output as JSON
+        #[clap(short, long)]
+        json: bool,
+
+        /// Only show note IDs and titles
+        #[clap(short, long)]
+        brief: bool,
+    },
+
+    /// Search notes by title or content
+    Search {
+        /// Search query text
+        query: String,
+
+        /// Limit the number of search results
+        #[clap(short = 'n', long, default_value_t = 10)]
+        limit: usize,
+
+        /// Format output as JSON
+        #[clap(short, long)]
+        json: bool,
+    },
+
+    /// Edit an existing note
+    Edit {
+        /// ID of the note to edit
+        id: String,
+
+        /// New title for the note
+        #[clap(short = 'T', long)]
+        title: Option<String>,
+
+        /// New content for the note
+        #[clap(short, long)]
+        content: Option<String>,
+
+        /// Open content in editor before saving
+        #[clap(short, long)]
+        edit: bool,
+
+        /// Tags to associate with the note (comma-separated)
+        #[clap(short = 't', long)]
+        tags: Option<String>,
+
+        /// Path to a file containing the new note content
+        #[clap(short, long)]
+        file: Option<PathBuf>,
+    },
+
+    /// Delete a note by ID
+    Delete {
+        /// ID of the note to delete
+        id: String,
+
+        /// Skip confirmation prompt
+        #[clap(short, long)]
+        force: bool,
+    },
+
+    /// Tag operations (add, remove, list)
+    Tag {
+        /// ID of the note to modify
+        id: String,
+
+        /// Tags to add (comma-separated)
+        #[clap(short, long)]
+        add: Option<String>,
+
+        /// Tags to remove (comma-separated)
+        #[clap(short, long)]
+        remove: Option<String>,
+
+        /// List all tags for the note
+        #[clap(short, long)]
+        list: bool,
+    },
+
+    /// Create a backup of all notes
+    Backup {
+        /// Path for the backup file (default uses config setting)
+        #[clap(short, long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Restore notes from a backup
+    Restore {
+        /// Path to the backup file
+        backup_file: PathBuf,
+
+        /// Skip confirmation prompt
+        #[clap(short, long)]
+        force: bool,
+    },
+
+    /// Configuration management
+    Config {
+        /// Show current configuration
+        #[clap(short = 'S', long)]
+        show: bool,
+
+        /// Update a configuration setting
+        #[clap(short, long)]
+        set: Option<String>,
+
+        /// Reset configuration to defaults
+        #[clap(short, long)]
+        reset: bool,
+    },
+
+    /// Import notes from external sources
+    Import {
+        /// Path to the file or directory to import from
+        source: PathBuf,
+
+        /// Format of the import source
+        #[clap(short, long, value_parser = ["markdown", "json", "text"], default_value = "markdown")]
+        format: String,
+
+        /// Default tags to apply to imported notes (comma-separated)
+        #[clap(short, long)]
+        tags: Option<String>,
+    },
+
+    /// Export notes to various formats
+    Export {
+        /// Path where exported files will be saved
+        #[clap(short, long)]
+        output: PathBuf,
+
+        /// Format to export to
+        #[clap(short, long, value_parser = ["markdown", "json", "html", "pdf"], default_value = "markdown")]
+        format: String,
+
+        /// Filter notes by tag for export
+        #[clap(short, long)]
+        tag: Option<String>,
+
+        /// Export as a single file instead of multiple files
+        #[clap(short = 's', long)]
+        single_file: bool,
+    },
 }

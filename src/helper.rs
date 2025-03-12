@@ -3,10 +3,10 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::errors::{KbError, Result};
-use crate::types::Note;
 use log::{debug, error, trace};
 use notify::EventKind;
+
+use crate::{KbError, Result, Note};
 
 /// Handles file system events by updating the notes cache
 pub async fn handle_fs_event(
@@ -85,4 +85,15 @@ pub fn load_note_from_file(path: &Path) -> Result<Note> {
 
     trace!("Successfully loaded note: {}", note.id);
     Ok(note)
+}
+
+// Helper method for parsing tags
+pub fn parse_tags(tags: Option<String>) -> Vec<String> {
+    tags.map(|t| {
+        t.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
 }
