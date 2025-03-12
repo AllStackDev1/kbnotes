@@ -1,10 +1,12 @@
-use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::{mpsc as std_mpsc, Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::{
+    cmp::{Ordering, Reverse},
+    collections::{BinaryHeap, HashMap, HashSet},
+    fs::{self, File},
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{mpsc as std_mpsc, Arc, Mutex},
+    time::{Duration, SystemTime},
+};
 
 use chrono::{DateTime, Utc};
 use log::{debug, error, info, trace, warn};

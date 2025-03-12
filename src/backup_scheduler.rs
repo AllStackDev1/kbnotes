@@ -1,6 +1,5 @@
 // src/backup_scheduler.rs - Backup scheduler module
-use std::path::PathBuf;
-use std::sync::{Arc, Weak};
+use std::{path::PathBuf, sync::{Arc, Weak}};
 
 use chrono::Utc;
 use log::{debug, error, info};

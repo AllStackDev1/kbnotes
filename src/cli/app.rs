@@ -2,11 +2,7 @@
 //!
 //! This module handles the command-line interface for interacting with the
 //! note storage system.
-use std::fs::{read_to_string, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Arc;
+use std::{fs::{read_to_string, OpenOptions}, io::Write, path::{Path, PathBuf}, process::Command, sync::Arc};
 
 use shell_words::split;
 use tempfile::Builder;

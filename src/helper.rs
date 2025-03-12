@@ -1,7 +1,4 @@
-use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::{collections::HashMap, fs, path::Path, sync::{Arc, Mutex}};
 
 use log::{debug, error, trace};
 use notify::EventKind;

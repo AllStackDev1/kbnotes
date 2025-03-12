@@ -3,8 +3,7 @@
 //! This module defines custom error types that categorize different failures
 //! that can occur during note management operations.
 
-use std::io;
-use std::path::PathBuf;
+use std::{io, path::PathBuf};
 
 use chrono::{DateTime, Utc};
 use thiserror::Error;

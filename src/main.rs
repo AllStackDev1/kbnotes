@@ -1,14 +1,11 @@
-use std::fs;
-use std::path::PathBuf;
-use std::process;
-use std::sync::Arc;
+use std::{fs, path::PathBuf, process, sync::Arc};
 
 use clap::Parser;
 use env_logger::Env;
 use log::{debug, error, info, warn};
 use tokio::sync::Mutex;
 
-use kbnotes::{Cli, App as CliApp, Config, KbError, NoteStorage, Result};
+use kbnotes::{App as CliApp, Cli, Config, KbError, NoteStorage, Result};
 
 #[tokio::main]
 async fn main() {
